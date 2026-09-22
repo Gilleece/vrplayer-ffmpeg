@@ -8,8 +8,8 @@ compatible build of the same library.
 
 ## What is here
 
-- `ffmpeg-6.0.2-3f92512.tar.gz`: FFmpeg, branch `release/6.0` at commit
-  `3f92512fd1fd6f5e6d6eb45a156c352835314d69` (RELEASE file 6.0.2), unmodified, as a
+- `ffmpeg-6.1.6-9266ee0.tar.gz`: FFmpeg, tag `n6.1.6` on branch `release/6.1` at commit
+  `9266ee001cb04b9dd6ff0335022bd986e2bc8e8b` (RELEASE file 6.1.6), unmodified, as a
   `git archive` of that commit from https://git.ffmpeg.org/ffmpeg.git. `fetch-ffmpeg.sh`
   unpacks it into `ffmpeg/` (or clones the same commit when the tarball is absent).
   FFmpeg is LGPL-2.1-or-later (`LICENSE`, which is FFmpeg's `COPYING.LGPLv2.1`).

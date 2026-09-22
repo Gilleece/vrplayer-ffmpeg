@@ -27,9 +27,13 @@ count mismatch"), one unit per packet or not.
 
 ## Inputs
 
-- FFmpeg branch `release/6.0` at commit `3f92512fd1fd6f5e6d6eb45a156c352835314d69` (RELEASE file
-  `6.0.2`, committed 2026-07-23). The module's README recommends 6.0 and its JNI uses the
-  `ch_layout` API, so 5.1 or later is required.
+- FFmpeg tag `n6.1.6` on branch `release/6.1`, commit `9266ee001cb04b9dd6ff0335022bd986e2bc8e8b`
+  (RELEASE file `6.1.6`, released 2026-06-20), since 2026-09-22; before that `release/6.0` at
+  `3f92512fd1fd6f5e6d6eb45a156c352835314d69` (6.0.2, 2023 code) from Phase 1 to the first
+  Phase 8 merge. The move was the security audit's finding 7: the 6.0 branch has had no point
+  release since, and 6.1.6 carries three years of decoder fixes. The module's README recommends
+  6.0 and its JNI uses the `ch_layout` API, so 5.1 or later is required; 6.1 built and linked
+  with no change to `ffmpeg_jni.cc`.
 - NDK `27.0.12077973`, host `darwin-x86_64`, `ANDROID_ABI` 29 (the app's minSdk).
 - Decoders: `ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le`.
 - No `--enable-gpl`, no `--enable-nonfree`, no external codec libraries. configure reports
@@ -39,8 +43,8 @@ count mismatch"), one unit per packet or not.
 
 ```
 cd decoder_ffmpeg/src/main/jni
-git clone --branch release/6.0 https://git.ffmpeg.org/ffmpeg.git ffmpeg
-git -C ffmpeg checkout 3f92512fd1fd6f5e6d6eb45a156c352835314d69
+git clone --branch release/6.1 https://git.ffmpeg.org/ffmpeg.git ffmpeg
+git -C ffmpeg checkout n6.1.6
 ./build_ffmpeg.sh "$(pwd)/.." "$HOME/Library/Android/sdk/ndk/27.0.12077973" darwin-x86_64 29 \
     ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le
 ```
@@ -71,7 +75,15 @@ eleven above; parsers ac3 and mlp (pulled in by the decoders); no encoders, demu
 protocols, filters or hwaccels; external libraries iconv and zlib (both from bionic and the NDK,
 permissive); NEON on, runtime cpu detection on.
 
-## Results (2026-09-04, Mac)
+## Results (2026-09-22, Mac, 6.1.6)
+
+- Whole script, four ABIs: 1 min 40 s wall clock (140.8 s user, 186 percent CPU).
+- Static libraries for arm64-v8a: `libavcodec.a` 8,056,296 bytes, `libavutil.a` 4,151,562,
+  `libswresample.a` 574,278.
+- configure for arm64: the same eleven decoders, parsers ac3 and mlp, external libraries iconv
+  and zlib, `License: LGPL version 2.1 or later`.
+
+## Results (2026-09-04, Mac, 6.0.2)
 
 - Whole script, four ABIs: 1 min 28 s wall clock (129.8 s user, 194 percent CPU).
 - Static libraries for arm64-v8a: `libavcodec.a` 8,228,212 bytes, `libavutil.a` 3,903,858,

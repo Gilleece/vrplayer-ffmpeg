@@ -100,11 +100,13 @@ const AVCodec* getCodecByName(JNIEnv* env, jstring codecName);
 /**
  * Allocates and opens a new AVCodecContext for the specified codec, passing the
  * provided extraData as initialization data for the decoder if it is non-NULL.
- * Returns the created context.
+ * The block align and bit rate are the container's, for the codecs that need
+ * them, and 0 otherwise. Returns the created context.
  */
 AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
                               jbyteArray extraData, jboolean outputFloat,
-                              jint rawSampleRate, jint rawChannelCount);
+                              jint rawSampleRate, jint rawChannelCount,
+                              jint blockAlign, jlong bitRate);
 
 struct GrowOutputBufferCallback {
   uint8_t* operator()(int requiredSize) const;
@@ -196,14 +198,15 @@ LIBRARY_FUNC(jboolean, ffmpegHasDecoder, jstring codecName) {
 
 AUDIO_DECODER_FUNC(jlong, ffmpegInitialize, jstring codecName,
                    jbyteArray extraData, jboolean outputFloat,
-                   jint rawSampleRate, jint rawChannelCount) {
+                   jint rawSampleRate, jint rawChannelCount, jint blockAlign,
+                   jlong bitRate) {
   const AVCodec* codec = getCodecByName(env, codecName);
   if (!codec) {
     LOGE("Codec not found.");
     return 0L;
   }
   return (jlong)createContext(env, codec, extraData, outputFloat, rawSampleRate,
-                              rawChannelCount);
+                              rawChannelCount, blockAlign, bitRate);
 }
 
 AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
@@ -309,7 +312,9 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
     AVCodecContext* created =
         createContext(env, codec, extraData, outputFloat,
                       /* rawSampleRate= */ -1,
-                      /* rawChannelCount= */ -1);
+                      /* rawChannelCount= */ -1,
+                      /* blockAlign= */ 0,
+                      /* bitRate= */ 0);
     if (created && haveOutput) {
       DecoderState* state = (DecoderState*)created->opaque;
       if (av_channel_layout_copy(&state->outLayout, &outLayout) >= 0) {
@@ -343,7 +348,8 @@ const AVCodec* getCodecByName(JNIEnv* env, jstring codecName) {
 
 AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
                               jbyteArray extraData, jboolean outputFloat,
-                              jint rawSampleRate, jint rawChannelCount) {
+                              jint rawSampleRate, jint rawChannelCount,
+                              jint blockAlign, jlong bitRate) {
   AVCodecContext* context = avcodec_alloc_context3(codec);
   if (!context) {
     LOGE("Failed to allocate context.");
@@ -354,8 +360,9 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
   if (extraData) {
     jsize size = env->GetArrayLength(extraData);
     context->extradata_size = size;
+    // Zeroed, padding included, which the bitstream reader may run into
     context->extradata =
-        (uint8_t*)av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE);
+        (uint8_t*)av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!context->extradata) {
       LOGE("Failed to allocate extradata.");
       releaseContext(context);
@@ -363,10 +370,24 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
     }
     env->GetByteArrayRegion(extraData, 0, size, (jbyte*)context->extradata);
   }
+  // Windows Media Audio, like raw mu-law and A-law, has its rate and channels
+  // only in the container. wmapro and wmalossless then take the channel mask
+  // from the extradata.
+  bool wma = context->codec_id == AV_CODEC_ID_WMAV1 ||
+             context->codec_id == AV_CODEC_ID_WMAV2 ||
+             context->codec_id == AV_CODEC_ID_WMAPRO ||
+             context->codec_id == AV_CODEC_ID_WMALOSSLESS;
   if (context->codec_id == AV_CODEC_ID_PCM_MULAW ||
-      context->codec_id == AV_CODEC_ID_PCM_ALAW) {
+      context->codec_id == AV_CODEC_ID_PCM_ALAW ||
+      (wma && rawSampleRate > 0 && rawChannelCount > 0)) {
     context->sample_rate = rawSampleRate;
     av_channel_layout_default(&context->ch_layout, rawChannelCount);
+  }
+  if (blockAlign > 0) {
+    context->block_align = blockAlign;
+  }
+  if (bitRate > 0) {
+    context->bit_rate = bitRate;
   }
   context->err_recognition = AV_EF_IGNORE_ERR;
   int result = avcodec_open2(context, codec, NULL);

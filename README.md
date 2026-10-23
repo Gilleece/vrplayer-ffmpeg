@@ -16,9 +16,11 @@ compatible build of the same library.
 - `module/`: the JNI wrapper and build script, from `libraries/decoder_ffmpeg` of
   https://github.com/androidx/media at tag 1.11.0 (commit `2bc20785`), Apache-2.0
   (`module/LICENSE`). `build_ffmpeg.sh` enables the h264 parser and `CMakeLists.txt` builds
-  the video JNI too. `ffmpeg_jni.cc` carries one change: TrueHD samples are split into access
-  units with an `AVCodecParserContext` before decoding. `ffmpeg_video_jni.cc`, the video
-  decoder for 10 bit H.264 and MPEG-4 Part 2, is the app owner's. All described in `BUILD.md`.
+  the video JNI too. `ffmpeg_jni.cc` carries two changes: TrueHD samples are split into access
+  units with an `AVCodecParserContext` before decoding, and Windows Media Audio gets its sample
+  rate, channels, block align and bit rate from the container. `ffmpeg_video_jni.cc`, the
+  video decoder for 10 bit H.264, MPEG-4 Part 2, WMV and VC-1, is the app owner's. All
+  described in `BUILD.md`.
 - `BUILD.md`: the exact build recipe, toolchain versions, decoder list and the configure line
   that produced the shipped library.
 

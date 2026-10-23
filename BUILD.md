@@ -3,7 +3,10 @@
 The `decoder_ffmpeg/` module is `libraries/decoder_ffmpeg` from the androidx/media repository at
 tag 1.11.0 (commit `2bc20785`), copied verbatim apart from `build.gradle`, which is rewritten for
 this tree, `src/main/jni/ffmpeg_jni.cc`, which is changed as below, `build_ffmpeg.sh`, which
-enables the h264 parser, and `CMakeLists.txt`, which builds the video JNI too. Its JNI wrapper
+enables the h264 parser, `CMakeLists.txt`, which builds the video JNI too, `FfmpegLibrary.java`,
+which names the decoders for the video codecs and picks the WMV and WMA decoder by the codecs
+string, and `FfmpegAudioDecoder.java` and `FfmpegAudioRenderer.java`, which pass WMA's codecs
+string, extradata, block align and bit rate on. Its JNI wrapper
 links FFmpeg's `libavcodec`, `libavutil` and `libswresample` statically into `libffmpegJNI.so`,
 so that library is an LGPL 2.1 work as a whole: this file is the build recipe that goes with the
 published source (spec 4.3), and the JNI wrapper is part of it.
@@ -31,6 +34,21 @@ before it opens, since Microsoft's variants have none in the stream, and for eve
 H.264 each sample's time goes in as its decode time too, while a frame comes back with its own
 time, the time of the sample it came out with and the decoder's reorder delay (`has_b_frames`),
 from which the Java side works out when it is shown. AVI has decode order times only.
+
+## Windows Media (2026-10-23)
+
+WMV and WMA files come from the app's own ASF extractor, and no headset has a MediaCodec decoder
+for any of them, so they go to FFmpeg's `wmv1`, `wmv2`, `wmv3`, `vc1`, `wmav1`, `wmav2`,
+`wmapro` and `wmalossless` decoders, all LGPL. No parser is needed: each ASF media object is a
+whole frame, and VC-1's Advanced Profile carries its sequence headers in band, which the decoder
+reads. The video goes through the video JNI unchanged: WMV3's 4 byte sequence header or VC-1's
+headers are the extradata, the track's frame size goes on the context, and ASF's object times
+are in decode order like AVI's, so the same reorder sum gives when a frame is shown. `vc1` and
+`wmv3` have no threads in FFmpeg and decode on one core. For the audio, `ffmpeg_jni.cc` takes
+the block align and bit rate from the track's WAVEFORMATEX and puts them, with the sample rate and
+channel count, on the context before it opens, which all four decoders need; `wmapro` and
+`wmalossless` take the channel mask from the extradata. The extradata buffer is now zeroed,
+padding included.
 
 ## The TrueHD change to ffmpeg_jni.cc
 
@@ -61,8 +79,9 @@ count mismatch"), one unit per packet or not.
   with no change to `ffmpeg_jni.cc`.
 - NDK `27.0.12077973`, host `darwin-x86_64`, `ANDROID_ABI` 29 (the app's minSdk).
 - Decoders: `ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4
-  msmpeg4v2 msmpeg4v3` (h264 since 2026-10-17, the three MPEG-4 ones since 2026-10-23), and the
-  `h264` parser through `--enable-parser=h264` in the script's common options.
+  msmpeg4v2 msmpeg4v3 wmv1 wmv2 wmv3 vc1 wmav1 wmav2 wmapro wmalossless` (h264 since 2026-10-17,
+  the three MPEG-4 ones and the eight Windows Media ones since 2026-10-23), and the `h264` parser
+  through `--enable-parser=h264` in the script's common options.
 - No `--enable-gpl`, no `--enable-nonfree`, no external codec libraries. configure reports
   `License: LGPL version 2.1 or later`.
 
@@ -73,7 +92,8 @@ cd decoder_ffmpeg/src/main/jni
 git clone --branch release/6.1 https://git.ffmpeg.org/ffmpeg.git ffmpeg
 git -C ffmpeg checkout n6.1.6
 ./build_ffmpeg.sh "$(pwd)/.." "$HOME/Library/Android/sdk/ndk/27.0.12077973" darwin-x86_64 29 \
-    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4 msmpeg4v2 msmpeg4v3
+    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4 msmpeg4v2 msmpeg4v3 \
+    wmv1 wmv2 wmv3 vc1 wmav1 wmav2 wmapro wmalossless
 ```
 
 The script is the upstream one with one line added to its common options,
@@ -97,13 +117,26 @@ The `ffmpeg/` directory is gitignored.
   --enable-decoder=mlp --enable-decoder=flac --enable-decoder=alac --enable-decoder=vorbis
   --enable-decoder=opus --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le
   --enable-decoder=h264 --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2
-  --enable-decoder=msmpeg4v3
+  --enable-decoder=msmpeg4v3 --enable-decoder=wmv1 --enable-decoder=wmv2 --enable-decoder=wmv3
+  --enable-decoder=vc1 --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmapro
+  --enable-decoder=wmalossless
 ```
 
-configure summary for arm64: libraries avcodec, avutil, swresample; enabled decoders the fifteen
-above and h263, which mpeg4 pulls in; parsers ac3, h263, h264, mlp and mpeg4video; no encoders, demuxers, muxers, protocols, filters,
-bitstream filters or hwaccels; external libraries iconv and zlib (both from bionic and the NDK,
+configure summary for arm64: libraries avcodec, avutil, swresample; enabled decoders the
+twenty three above and h263, which mpeg4 pulls in; parsers ac3, h263, h264, mlp and mpeg4video;
+no encoders, demuxers, muxers, protocols, filters, bitstream filters or hwaccels; external libraries iconv and zlib (both from bionic and the NDK,
 permissive); NEON, DOTPROD and I8MM on, runtime cpu detection on, threading pthreads.
+
+## Results (2026-10-23, Mac, 6.1.6 with h264, MPEG-4 and Windows Media)
+
+- Whole script, four ABIs: 3 min 30 s wall clock (361.9 s user, 79.8 s sys).
+- Static libraries for arm64-v8a: `libavcodec.a` 27,361,876 bytes, `libavutil.a` 4,151,866,
+  `libswresample.a` 574,590.
+- configure for arm64: twenty four decoders (the twenty three named and h263), parsers ac3,
+  h263, h264, mlp and mpeg4video, external libraries iconv and zlib, `License: LGPL version 2.1
+  or later`. No GPL, no nonfree.
+- `libffmpegJNI.so` for arm64, stripped, in the debug build: 3,564,192 bytes, against 3,103,400
+  without Windows Media.
 
 ## Results (2026-10-23, Mac, 6.1.6 with h264 and MPEG-4)
 

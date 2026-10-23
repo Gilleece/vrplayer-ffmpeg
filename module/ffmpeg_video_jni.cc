@@ -2,8 +2,8 @@
 
 // The video half of the FFmpeg module: libavcodec's software decoders for the
 // files no MediaCodec decoder on the headset plays well, 10 bit H.264 (High
-// 10) and MPEG-4 Part 2 with Microsoft's v2 and v3 (DivX, Xvid). Both come out
-// as 8 or 10 bit 4:2:0. FfmpegVideoDecoder drives it from its own thread. A
+// 10), MPEG-4 Part 2 with Microsoft's v2 and v3 (DivX, Xvid), and WMV 7, 8
+// and 9 with VC-1. All come out as 8 or 10 bit 4:2:0. FfmpegVideoDecoder drives it from its own thread. A
 // frame that comes out is held here until Java has an output buffer for it,
 // then its planes are copied into that buffer and the frame is let go.
 #include <android/log.h>
@@ -159,7 +159,8 @@ VIDEO_FUNC(jlong, ffmpegVideoInit, jstring codecName, jbyteArray extraData,
     context->extradata_size = size;
     env->GetByteArrayRegion(extraData, 0, size, (jbyte*)context->extradata);
   }
-  // Microsoft's MPEG-4 has no frame size in the stream, only in the container
+  // Microsoft's MPEG-4, WMV 7 and 8 and WMV3 have no frame size in the
+  // stream, only in the container
   if (width > 0 && height > 0) {
     context->width = width;
     context->height = height;

@@ -45,6 +45,7 @@ COMMON_OPTIONS="
     --extra-ldexeflags=-pie
     --disable-v4l2-m2m
     --disable-vulkan
+    --enable-parser=h264
     "
 TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
 if [[ ! -d "${TOOLCHAIN_PREFIX}" ]]

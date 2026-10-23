@@ -1,11 +1,36 @@
-# FFmpeg audio decoder build
+# FFmpeg decoder build
 
 The `decoder_ffmpeg/` module is `libraries/decoder_ffmpeg` from the androidx/media repository at
 tag 1.11.0 (commit `2bc20785`), copied verbatim apart from `build.gradle`, which is rewritten for
-this tree, and `src/main/jni/ffmpeg_jni.cc`, which is changed as below. Its JNI wrapper links
-FFmpeg's `libavcodec`, `libavutil` and `libswresample` statically into `libffmpegJNI.so`, so that
-library is an LGPL 2.1 work as a whole: this file is the build recipe that goes with the published
-source (spec 4.3), and the JNI wrapper is part of it.
+this tree, `src/main/jni/ffmpeg_jni.cc`, which is changed as below, `build_ffmpeg.sh`, which
+enables the h264 parser, and `CMakeLists.txt`, which builds the video JNI too. Its JNI wrapper
+links FFmpeg's `libavcodec`, `libavutil` and `libswresample` statically into `libffmpegJNI.so`,
+so that library is an LGPL 2.1 work as a whole: this file is the build recipe that goes with the
+published source (spec 4.3), and the JNI wrapper is part of it.
+
+## The H.264 video decoder (2026-10-17)
+
+10 bit H.264 (High 10) has no hardware decoder on any headset, so since 1.1.0 it decodes in
+software on Gen 2 headsets. `src/main/jni/ffmpeg_video_jni.cc` (the owner's) opens FFmpeg's
+`h264` decoder with frame threads, cores minus two, from the decoder's own thread at default
+priority so the frame threads do not take the player thread's audio priority, takes the Annex B
+samples and parameter
+sets Media3's extractors hand over, and copies each `yuv420p10le` (or 8 bit `yuv420p`) frame
+into a Media3 output buffer as three planes. `FfmpegVideoDecoder`, `FfmpegVideoRenderer`,
+`FfmpegVideoOutputBuffer` and `FfmpegVideoPlanes` are the Java side, also the owner's. The
+decoder is LGPL like the rest of the build and lives in the same dynamically loaded `.so`. No
+bitstream filter is needed: the decoder reads Annex B and avcC extradata itself.
+
+## MPEG-4 Part 2 (2026-10-23)
+
+AVI files carry MPEG-4 Part 2 (DivX, Xvid) or Microsoft's MPEG-4 v2 and v3, which no headset
+decodes well with MediaCodec, so they go through the same video JNI with FFmpeg's `mpeg4`,
+`msmpeg4v2` and `msmpeg4v3` decoders, all LGPL. They output 8 bit `yuv420p`, which the JNI
+already copied. Two changes to `ffmpeg_video_jni.cc`: the track's frame size goes on the context
+before it opens, since Microsoft's variants have none in the stream, and for every codec but
+H.264 each sample's time goes in as its decode time too, while a frame comes back with its own
+time, the time of the sample it came out with and the decoder's reorder delay (`has_b_frames`),
+from which the Java side works out when it is shown. AVI has decode order times only.
 
 ## The TrueHD change to ffmpeg_jni.cc
 
@@ -35,7 +60,9 @@ count mismatch"), one unit per packet or not.
   6.0 and its JNI uses the `ch_layout` API, so 5.1 or later is required; 6.1 built and linked
   with no change to `ffmpeg_jni.cc`.
 - NDK `27.0.12077973`, host `darwin-x86_64`, `ANDROID_ABI` 29 (the app's minSdk).
-- Decoders: `ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le`.
+- Decoders: `ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4
+  msmpeg4v2 msmpeg4v3` (h264 since 2026-10-17, the three MPEG-4 ones since 2026-10-23), and the
+  `h264` parser through `--enable-parser=h264` in the script's common options.
 - No `--enable-gpl`, no `--enable-nonfree`, no external codec libraries. configure reports
   `License: LGPL version 2.1 or later`.
 
@@ -46,10 +73,11 @@ cd decoder_ffmpeg/src/main/jni
 git clone --branch release/6.1 https://git.ffmpeg.org/ffmpeg.git ffmpeg
 git -C ffmpeg checkout n6.1.6
 ./build_ffmpeg.sh "$(pwd)/.." "$HOME/Library/Android/sdk/ndk/27.0.12077973" darwin-x86_64 29 \
-    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le
+    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4 msmpeg4v2 msmpeg4v3
 ```
 
-The script is the upstream one and builds armeabi-v7a, arm64-v8a, x86 and x86_64 in turn; only
+The script is the upstream one with one line added to its common options,
+`--enable-parser=h264`, and builds armeabi-v7a, arm64-v8a, x86 and x86_64 in turn; only
 `android-libs/arm64-v8a` is used, since the app is arm64 only. Gradle then builds
 `libffmpegJNI.so` through the module's `CMakeLists.txt` whenever `src/main/jni/ffmpeg` exists.
 The `ffmpeg/` directory is gitignored.
@@ -64,16 +92,42 @@ The `ffmpeg/` directory is gitignored.
   --target-os=android --enable-static --disable-shared --disable-doc --disable-programs
   --disable-everything --disable-avdevice --disable-avformat --disable-swscale
   --disable-postproc --disable-avfilter --disable-symver --enable-swresample
-  --extra-ldexeflags=-pie --disable-v4l2-m2m --disable-vulkan
+  --extra-ldexeflags=-pie --disable-v4l2-m2m --disable-vulkan --enable-parser=h264
   --enable-decoder=ac3 --enable-decoder=eac3 --enable-decoder=dca --enable-decoder=truehd
   --enable-decoder=mlp --enable-decoder=flac --enable-decoder=alac --enable-decoder=vorbis
   --enable-decoder=opus --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le
+  --enable-decoder=h264 --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2
+  --enable-decoder=msmpeg4v3
 ```
 
-configure summary for arm64: libraries avcodec, avutil, swresample; enabled decoders exactly the
-eleven above; parsers ac3 and mlp (pulled in by the decoders); no encoders, demuxers, muxers,
-protocols, filters or hwaccels; external libraries iconv and zlib (both from bionic and the NDK,
-permissive); NEON on, runtime cpu detection on.
+configure summary for arm64: libraries avcodec, avutil, swresample; enabled decoders the fifteen
+above and h263, which mpeg4 pulls in; parsers ac3, h263, h264, mlp and mpeg4video; no encoders, demuxers, muxers, protocols, filters,
+bitstream filters or hwaccels; external libraries iconv and zlib (both from bionic and the NDK,
+permissive); NEON, DOTPROD and I8MM on, runtime cpu detection on, threading pthreads.
+
+## Results (2026-10-23, Mac, 6.1.6 with h264 and MPEG-4)
+
+- Whole script, four ABIs: 3 min 8 s wall clock (302.3 s user, 72.5 s sys).
+- Static libraries for arm64-v8a: `libavcodec.a` 23,707,184 bytes, `libavutil.a` 4,151,682,
+  `libswresample.a` 574,398.
+- configure for arm64: sixteen decoders (the fifteen named and h263), parsers ac3, h263, h264,
+  mlp and mpeg4video, external libraries iconv and zlib, `License: LGPL version 2.1 or later`.
+  No GPL, no nonfree.
+- `libffmpegJNI.so` for arm64, stripped, in the debug build: 3,103,400 bytes, against 2,715,000
+  with h264 alone.
+
+## Results (2026-10-17, Mac, 6.1.6 with h264)
+
+- Whole script, four ABIs: 9 min 26 s wall clock (322.3 s user, 101.9 s sys), with other builds
+  running on the Mac at the same time.
+- Static libraries for arm64-v8a: `libavcodec.a` 19,188,442 bytes, `libavutil.a` 4,150,490,
+  `libswresample.a` 574,158.
+- configure for arm64: the twelve decoders, parsers ac3, h264 and mlp, no bitstream filters,
+  external libraries iconv and zlib, `License: LGPL version 2.1 or later`. No GPL, no nonfree.
+- `libffmpegJNI.so` for arm64, stripped, in the debug build: 2,715,000 bytes, against 1,402,384
+  before the h264 decoder and the video JNI.
+- The source offer repository holds the 6.1.6 tarball, the JNI wrapper, the build script and this
+  recipe, so the new script line, `ffmpeg_video_jni.cc` and the CMake change go there too.
 
 ## Results (2026-09-22, Mac, 6.1.6)
 

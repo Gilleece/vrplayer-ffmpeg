@@ -44,7 +44,8 @@ find_library(android_log_lib log)
 
 add_library(ffmpegJNI
             SHARED
-            ffmpeg_jni.cc)
+            ffmpeg_jni.cc
+            ffmpeg_video_jni.cc)
 
 target_link_libraries(ffmpegJNI
                       PRIVATE android

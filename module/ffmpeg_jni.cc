@@ -74,11 +74,21 @@ static const int AUDIO_DECODER_ERROR_OTHER = -2;
 static jmethodID growOutputBufferMethod;
 
 /**
- * What hangs off the codec context: the resampler, made when the first frame
- * arrives, and for TrueHD the parser that splits a sample into access units.
+ * What hangs off the codec context: the resampler and the input it was built
+ * for, the output format fixed by the first frame, since that is what the Java
+ * side reports to the sink, a packet and a frame reused for every call, and for
+ * TrueHD the parser that splits a sample into access units.
  */
 struct DecoderState {
   SwrContext* resampleContext;
+  AVChannelLayout inLayout;
+  int inFormat;
+  int inRate;
+  AVChannelLayout outLayout;
+  int outRate;
+  int haveOutput;
+  AVPacket* packet;
+  AVFrame* frame;
   AVCodecParserContext* parser;
 };
 
@@ -217,25 +227,21 @@ AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
   }
   uint8_t* inputBuffer = (uint8_t*)env->GetDirectBufferAddress(inputData);
   uint8_t* outputBuffer = (uint8_t*)env->GetDirectBufferAddress(outputData);
-  AVPacket* packet = av_packet_alloc();
-  if (!packet) {
-    LOGE("Failed to allocate packet.");
-    return -1;
-  }
   AVCodecContext* avContext = (AVCodecContext*)context;
+  DecoderState* state = (DecoderState*)avContext->opaque;
+  AVPacket* packet = state->packet;
   GrowOutputBufferCallback growBuffer{env, thiz, decoderOutputBuffer};
   OutputBuffer output = {outputBuffer, outputSize, 0, growBuffer};
-  AVCodecParserContext* parser = ((DecoderState*)avContext->opaque)->parser;
   int ret;
-  if (parser) {
-    ret = decodeAccessUnits(avContext, parser, packet, inputBuffer, inputSize,
-                            &output);
+  if (state->parser) {
+    ret = decodeAccessUnits(avContext, state->parser, packet, inputBuffer,
+                            inputSize, &output);
   } else {
     packet->data = inputBuffer;
     packet->size = inputSize;
     ret = decodePacket(avContext, packet, &output);
   }
-  av_packet_free(&packet);
+  av_packet_unref(packet);
   return ret < 0 ? ret : output.written;
 }
 
@@ -255,7 +261,10 @@ AUDIO_DECODER_FUNC(jint, ffmpegGetChannelCount, jlong context) {
     LOGE("Context must be non-NULL.");
     return -1;
   }
-  return ((AVCodecContext*)context)->ch_layout.nb_channels;
+  AVCodecContext* avContext = (AVCodecContext*)context;
+  DecoderState* state = (DecoderState*)avContext->opaque;
+  return state->haveOutput ? state->outLayout.nb_channels
+                           : avContext->ch_layout.nb_channels;
 }
 
 AUDIO_DECODER_FUNC(jint, ffmpegGetSampleRate, jlong context) {
@@ -263,7 +272,9 @@ AUDIO_DECODER_FUNC(jint, ffmpegGetSampleRate, jlong context) {
     LOGE("Context must be non-NULL.");
     return -1;
   }
-  return ((AVCodecContext*)context)->sample_rate;
+  AVCodecContext* avContext = (AVCodecContext*)context;
+  DecoderState* state = (DecoderState*)avContext->opaque;
+  return state->haveOutput ? state->outRate : avContext->sample_rate;
 }
 
 AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
@@ -277,17 +288,37 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
   if (codecId == AV_CODEC_ID_TRUEHD) {
     jboolean outputFloat =
         (jboolean)(context->request_sample_fmt == OUTPUT_FORMAT_PCM_FLOAT);
+    // The output the Java side already reported carries over to the new
+    // context
+    DecoderState* old = (DecoderState*)context->opaque;
+    AVChannelLayout outLayout = {};
+    int outRate = old->outRate;
+    int haveOutput = old->haveOutput;
+    if (haveOutput && av_channel_layout_copy(&outLayout, &old->outLayout) < 0) {
+      haveOutput = 0;
+    }
     // Release and recreate the context if the codec is TrueHD.
     // TODO: Figure out why flushing doesn't work for this codec.
     releaseContext(context);
     const AVCodec* codec = avcodec_find_decoder(codecId);
     if (!codec) {
       LOGE("Unexpected error finding codec %d.", codecId);
+      av_channel_layout_uninit(&outLayout);
       return 0L;
     }
-    return (jlong)createContext(env, codec, extraData, outputFloat,
-                                /* rawSampleRate= */ -1,
-                                /* rawChannelCount= */ -1);
+    AVCodecContext* created =
+        createContext(env, codec, extraData, outputFloat,
+                      /* rawSampleRate= */ -1,
+                      /* rawChannelCount= */ -1);
+    if (created && haveOutput) {
+      DecoderState* state = (DecoderState*)created->opaque;
+      if (av_channel_layout_copy(&state->outLayout, &outLayout) >= 0) {
+        state->outRate = outRate;
+        state->haveOutput = 1;
+      }
+    }
+    av_channel_layout_uninit(&outLayout);
+    return (jlong)created;
   }
 
   avcodec_flush_buffers(context);
@@ -350,6 +381,15 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
     releaseContext(context);
     return NULL;
   }
+  // Set straight away, so a failure below releases whatever was made
+  context->opaque = state;
+  state->packet = av_packet_alloc();
+  state->frame = av_frame_alloc();
+  if (!state->packet || !state->frame) {
+    LOGE("Failed to allocate packet or frame.");
+    releaseContext(context);
+    return NULL;
+  }
   if (context->codec_id == AV_CODEC_ID_TRUEHD) {
     // Media3's MatroskaExtractor glues 16 TrueHD access units into one sample,
     // which is what the MediaCodec passthrough path wants, but this decoder
@@ -360,12 +400,10 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
     state->parser = av_parser_init(AV_CODEC_ID_TRUEHD);
     if (!state->parser) {
       LOGE("Failed to allocate TrueHD parser.");
-      av_free(state);
       releaseContext(context);
       return NULL;
     }
   }
-  context->opaque = state;
   return context;
 }
 
@@ -422,6 +460,108 @@ int decodeAccessUnits(AVCodecContext* context, AVCodecParserContext* parser,
   return 0;
 }
 
+// Converts count samples of input, or when in is NULL whatever the resampler
+// still holds, and appends them to the output. What swr_convert says it wrote
+// is what counts, not the room reserved for it.
+static int convertSamples(DecoderState* state, AVSampleFormat outFormat,
+                          const uint8_t** in, int count, OutputBuffer* output) {
+  int outSamples = swr_get_out_samples(state->resampleContext, count);
+  if (outSamples < 0) {
+    logError("swr_get_out_samples", outSamples);
+    return AUDIO_DECODER_ERROR_INVALID_DATA;
+  }
+  if (outSamples == 0) {
+    return 0;
+  }
+  int frameSize =
+      av_get_bytes_per_sample(outFormat) * state->outLayout.nb_channels;
+  uint8_t* out = output->reserve(frameSize * outSamples);
+  if (!out) {
+    LOGE("Failed to reallocate output buffer.");
+    return AUDIO_DECODER_ERROR_OTHER;
+  }
+  int converted =
+      swr_convert(state->resampleContext, &out, outSamples, in, count);
+  if (converted < 0) {
+    logError("swr_convert", converted);
+    return AUDIO_DECODER_ERROR_INVALID_DATA;
+  }
+  output->written += converted * frameSize;
+  return 0;
+}
+
+// Builds the resampler for the frame's input when it is not the input the last
+// one was built for, since a stream can change its layout, rate or sample
+// format part way through. The output stays what the first frame set, which is
+// what the sink was configured with, so a change is remixed into it.
+static int prepareResampler(AVCodecContext* context, DecoderState* state,
+                            const AVFrame* frame, OutputBuffer* output) {
+  const AVChannelLayout* inLayout = frame->ch_layout.nb_channels > 0
+                                        ? &frame->ch_layout
+                                        : &context->ch_layout;
+  int inFormat = frame->format;
+  int inRate =
+      frame->sample_rate > 0 ? frame->sample_rate : context->sample_rate;
+  if (state->resampleContext && state->inFormat == inFormat &&
+      state->inRate == inRate &&
+      av_channel_layout_compare(&state->inLayout, inLayout) == 0) {
+    return 0;
+  }
+  int result;
+  if (!state->haveOutput) {
+    result = av_channel_layout_copy(&state->outLayout, inLayout);
+    if (result < 0) {
+      logError("av_channel_layout_copy", result);
+      return AUDIO_DECODER_ERROR_OTHER;
+    }
+    state->outRate = inRate;
+    state->haveOutput = 1;
+  }
+  if (state->resampleContext) {
+    LOGD("Input now %d channels at %d Hz, format %d, resampler rebuilt.",
+         inLayout->nb_channels, inRate, inFormat);
+    // What the old one still holds goes out before it is let go of
+    result = convertSamples(state, context->request_sample_fmt, NULL, 0,
+                            output);
+    swr_free(&state->resampleContext);
+    if (result < 0) {
+      return result;
+    }
+  }
+  SwrContext* resampleContext = NULL;
+  result = swr_alloc_set_opts2(&resampleContext,             // ps
+                               &state->outLayout,            // out_ch_layout
+                               context->request_sample_fmt,  // out_sample_fmt
+                               state->outRate,               // out_sample_rate
+                               inLayout,                     // in_ch_layout
+                               (AVSampleFormat)inFormat,     // in_sample_fmt
+                               inRate,                       // in_sample_rate
+                               0,                            // log_offset
+                               NULL                          // log_ctx
+  );
+  if (result < 0) {
+    logError("swr_alloc_set_opts2", result);
+    swr_free(&resampleContext);
+    return transformError(result);
+  }
+  result = swr_init(resampleContext);
+  if (result < 0) {
+    logError("swr_init", result);
+    swr_free(&resampleContext);
+    return transformError(result);
+  }
+  result = av_channel_layout_copy(&state->inLayout, inLayout);
+  if (result < 0) {
+    logError("av_channel_layout_copy", result);
+    swr_free(&resampleContext);
+    return AUDIO_DECODER_ERROR_OTHER;
+  }
+  state->resampleContext = resampleContext;
+  state->inFormat = inFormat;
+  state->inRate = inRate;
+  return 0;
+}
+
 int decodePacket(AVCodecContext* context, AVPacket* packet,
                  OutputBuffer* output) {
   int result = 0;
@@ -434,15 +574,10 @@ int decodePacket(AVCodecContext* context, AVPacket* packet,
 
   // Dequeue output data until it runs out.
   DecoderState* state = static_cast<DecoderState*>(context->opaque);
+  AVFrame* frame = state->frame;
   while (true) {
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) {
-      LOGE("Failed to allocate output frame.");
-      return AUDIO_DECODER_ERROR_INVALID_DATA;
-    }
     result = avcodec_receive_frame(context, frame);
     if (result) {
-      av_frame_free(&frame);
       if (result == AVERROR(EAGAIN)) {
         break;
       }
@@ -451,62 +586,16 @@ int decodePacket(AVCodecContext* context, AVPacket* packet,
     }
 
     // Resample output.
-    AVSampleFormat sampleFormat = context->sample_fmt;
-    int channelCount = context->ch_layout.nb_channels;
-    int sampleRate = context->sample_rate;
-    int sampleCount = frame->nb_samples;
-    int dataSize = av_samples_get_buffer_size(NULL, channelCount, sampleCount,
-                                              sampleFormat, 1);
-    SwrContext* resampleContext = state->resampleContext;
-    if (!resampleContext) {
-      result =
-          swr_alloc_set_opts2(&resampleContext,             // ps
-                              &context->ch_layout,          // out_ch_layout
-                              context->request_sample_fmt,  // out_sample_fmt
-                              sampleRate,                   // out_sample_rate
-                              &context->ch_layout,          // in_ch_layout
-                              sampleFormat,                 // in_sample_fmt
-                              sampleRate,                   // in_sample_rate
-                              0,                            // log_offset
-                              NULL                          // log_ctx
-          );
-      if (result < 0) {
-        logError("swr_alloc_set_opts2", result);
-        av_frame_free(&frame);
-        return transformError(result);
-      }
-      result = swr_init(resampleContext);
-      if (result < 0) {
-        logError("swr_init", result);
-        av_frame_free(&frame);
-        return transformError(result);
-      }
-      state->resampleContext = resampleContext;
+    result = prepareResampler(context, state, frame, output);
+    if (result >= 0) {
+      result = convertSamples(state, context->request_sample_fmt,
+                              (const uint8_t**)frame->extended_data,
+                              frame->nb_samples, output);
     }
-
-    int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
-    int outSamples = swr_get_out_samples(resampleContext, sampleCount);
-    int bufferOutSize = outSampleSize * channelCount * outSamples;
-    uint8_t* out = output->reserve(bufferOutSize);
-    if (!out) {
-      LOGE("Failed to reallocate output buffer.");
-      av_frame_free(&frame);
-      return AUDIO_DECODER_ERROR_OTHER;
-    }
-    result = swr_convert(resampleContext, &out, bufferOutSize,
-                         (const uint8_t**)frame->data, frame->nb_samples);
-    av_frame_free(&frame);
+    av_frame_unref(frame);
     if (result < 0) {
-      logError("swr_convert", result);
-      return AUDIO_DECODER_ERROR_INVALID_DATA;
+      return result;
     }
-    int available = swr_get_out_samples(resampleContext, 0);
-    if (available != 0) {
-      LOGE("Expected no samples remaining after resampling, but found %d.",
-           available);
-      return AUDIO_DECODER_ERROR_INVALID_DATA;
-    }
-    output->written += bufferOutSize;
   }
   return 0;
 }
@@ -535,6 +624,10 @@ void releaseContext(AVCodecContext* context) {
     if (state->parser) {
       av_parser_close(state->parser);
     }
+    av_packet_free(&state->packet);
+    av_frame_free(&state->frame);
+    av_channel_layout_uninit(&state->inLayout);
+    av_channel_layout_uninit(&state->outLayout);
     av_free(state);
     context->opaque = NULL;
   }

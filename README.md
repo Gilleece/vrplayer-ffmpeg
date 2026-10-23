@@ -1,7 +1,7 @@
 # vrplayer-ffmpeg
 
-The complete source of `libffmpegJNI.so`, the audio decoder library that the Realtime 3D
-Player VR app loads at runtime, published to satisfy the GNU Lesser General Public License
+The complete source of `libffmpegJNI.so`, the audio and video decoder library that the Realtime
+3D Player VR app loads at runtime, published to satisfy the GNU Lesser General Public License
 version 2.1 (section 6) under which FFmpeg is licensed. The app itself is closed source; this
 library is a separate work, built with no GPL or non-free parts, and may be replaced by a
 compatible build of the same library.
@@ -15,9 +15,10 @@ compatible build of the same library.
   FFmpeg is LGPL-2.1-or-later (`LICENSE`, which is FFmpeg's `COPYING.LGPLv2.1`).
 - `module/`: the JNI wrapper and build script, from `libraries/decoder_ffmpeg` of
   https://github.com/androidx/media at tag 1.11.0 (commit `2bc20785`), Apache-2.0
-  (`module/LICENSE`). `build_ffmpeg.sh` and `CMakeLists.txt` are verbatim. `ffmpeg_jni.cc`
-  carries one change: TrueHD samples are split into access units with an
-  `AVCodecParserContext` before decoding, described in `BUILD.md`.
+  (`module/LICENSE`). `build_ffmpeg.sh` enables the h264 parser and `CMakeLists.txt` builds
+  the video JNI too. `ffmpeg_jni.cc` carries one change: TrueHD samples are split into access
+  units with an `AVCodecParserContext` before decoding. `ffmpeg_video_jni.cc`, the video
+  decoder for 10 bit H.264 and MPEG-4 Part 2, is the app owner's. All described in `BUILD.md`.
 - `BUILD.md`: the exact build recipe, toolchain versions, decoder list and the configure line
   that produced the shipped library.
 
@@ -27,7 +28,7 @@ compatible build of the same library.
 ./fetch-ffmpeg.sh
 cd module
 ./build_ffmpeg.sh "$(pwd)" "$ANDROID_NDK" darwin-x86_64 29 \
-    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le
+    ac3 eac3 dca truehd mlp flac alac vorbis opus pcm_s16le pcm_s24le h264 mpeg4 msmpeg4v2 msmpeg4v3
 ```
 
 with `module/ffmpeg` a link or copy of `../ffmpeg`, then CMake through the module's

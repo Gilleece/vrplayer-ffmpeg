@@ -77,7 +77,9 @@ static jmethodID growOutputBufferMethod;
  * What hangs off the codec context: the resampler and the input it was built
  * for, the output format fixed by the first frame, since that is what the Java
  * side reports to the sink, a packet and a frame reused for every call, and for
- * TrueHD the parser that splits a sample into access units.
+ * TrueHD and MPEG audio the parser that splits a sample into access units.
+ * MPEG audio's parser writes the layer and rate it finds into the context it
+ * is given, so it gets a context of its own; TrueHD's works on the decoder's.
  */
 struct DecoderState {
   SwrContext* resampleContext;
@@ -90,6 +92,7 @@ struct DecoderState {
   AVPacket* packet;
   AVFrame* frame;
   AVCodecParserContext* parser;
+  AVCodecContext* parserContext;
 };
 
 /**
@@ -100,13 +103,14 @@ const AVCodec* getCodecByName(JNIEnv* env, jstring codecName);
 /**
  * Allocates and opens a new AVCodecContext for the specified codec, passing the
  * provided extraData as initialization data for the decoder if it is non-NULL.
- * The block align and bit rate are the container's, for the codecs that need
- * them, and 0 otherwise. Returns the created context.
+ * The block align, bit rate and bits per sample are the container's, for the
+ * codecs that need them, and 0 otherwise. Returns the created context.
  */
 AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
                               jbyteArray extraData, jboolean outputFloat,
                               jint rawSampleRate, jint rawChannelCount,
-                              jint blockAlign, jlong bitRate);
+                              jint blockAlign, jlong bitRate,
+                              jint bitsPerCodedSample);
 
 struct GrowOutputBufferCallback {
   uint8_t* operator()(int requiredSize) const;
@@ -139,12 +143,19 @@ int decodePacket(AVCodecContext* context, AVPacket* packet,
                  OutputBuffer* output);
 
 /**
- * Decodes a sample made of several access units, one unit at a time. Returns 0,
- * or a negative AUDIO_DECODER_ERROR constant value in the case of an error.
+ * Decodes a sample made of several access units, or of parts of them, one unit
+ * at a time. Returns 0, or a negative AUDIO_DECODER_ERROR constant value in the
+ * case of an error.
  */
-int decodeAccessUnits(AVCodecContext* context, AVCodecParserContext* parser,
+int decodeAccessUnits(AVCodecContext* context, DecoderState* state,
                       AVPacket* packet, const uint8_t* input, int inputSize,
                       OutputBuffer* output);
+
+/**
+ * Makes the parser for a codec that needs one, TrueHD and MPEG audio. Returns
+ * false when it cannot be made.
+ */
+bool openParser(AVCodecContext* context, DecoderState* state);
 
 /**
  * Transforms ffmpeg AVERROR into a negative AUDIO_DECODER_ERROR constant value.
@@ -199,14 +210,15 @@ LIBRARY_FUNC(jboolean, ffmpegHasDecoder, jstring codecName) {
 AUDIO_DECODER_FUNC(jlong, ffmpegInitialize, jstring codecName,
                    jbyteArray extraData, jboolean outputFloat,
                    jint rawSampleRate, jint rawChannelCount, jint blockAlign,
-                   jlong bitRate) {
+                   jlong bitRate, jint bitsPerCodedSample) {
   const AVCodec* codec = getCodecByName(env, codecName);
   if (!codec) {
     LOGE("Codec not found.");
     return 0L;
   }
   return (jlong)createContext(env, codec, extraData, outputFloat, rawSampleRate,
-                              rawChannelCount, blockAlign, bitRate);
+                              rawChannelCount, blockAlign, bitRate,
+                              bitsPerCodedSample);
 }
 
 AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
@@ -237,8 +249,8 @@ AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
   OutputBuffer output = {outputBuffer, outputSize, 0, growBuffer};
   int ret;
   if (state->parser) {
-    ret = decodeAccessUnits(avContext, state->parser, packet, inputBuffer,
-                            inputSize, &output);
+    ret = decodeAccessUnits(avContext, state, packet, inputBuffer, inputSize,
+                            &output);
   } else {
     packet->data = inputBuffer;
     packet->size = inputSize;
@@ -314,7 +326,8 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
                       /* rawSampleRate= */ -1,
                       /* rawChannelCount= */ -1,
                       /* blockAlign= */ 0,
-                      /* bitRate= */ 0);
+                      /* bitRate= */ 0,
+                      /* bitsPerCodedSample= */ 0);
     if (created && haveOutput) {
       DecoderState* state = (DecoderState*)created->opaque;
       if (av_channel_layout_copy(&state->outLayout, &outLayout) >= 0) {
@@ -327,6 +340,16 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
   }
 
   avcodec_flush_buffers(context);
+  // A frame cut off by the seek must not be glued to what comes after it
+  DecoderState* state = (DecoderState*)context->opaque;
+  if (state->parser) {
+    av_parser_close(state->parser);
+    state->parser = NULL;
+    if (!openParser(context, state)) {
+      releaseContext(context);
+      return 0L;
+    }
+  }
   return (jlong)context;
 }
 
@@ -349,7 +372,8 @@ const AVCodec* getCodecByName(JNIEnv* env, jstring codecName) {
 AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
                               jbyteArray extraData, jboolean outputFloat,
                               jint rawSampleRate, jint rawChannelCount,
-                              jint blockAlign, jlong bitRate) {
+                              jint blockAlign, jlong bitRate,
+                              jint bitsPerCodedSample) {
   AVCodecContext* context = avcodec_alloc_context3(codec);
   if (!context) {
     LOGE("Failed to allocate context.");
@@ -370,16 +394,14 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
     }
     env->GetByteArrayRegion(extraData, 0, size, (jbyte*)context->extradata);
   }
-  // Windows Media Audio, like raw mu-law and A-law, has its rate and channels
-  // only in the container. wmapro and wmalossless then take the channel mask
-  // from the extradata.
-  bool wma = context->codec_id == AV_CODEC_ID_WMAV1 ||
-             context->codec_id == AV_CODEC_ID_WMAV2 ||
-             context->codec_id == AV_CODEC_ID_WMAPRO ||
-             context->codec_id == AV_CODEC_ID_WMALOSSLESS;
+  // A codec that comes with a WAVEFORMATEX, which is any with a block align
+  // (Windows Media Audio, Microsoft and IMA ADPCM), has its rate and channels
+  // only in the container, like raw mu-law and A-law. wmapro and wmalossless
+  // then take the channel mask from the extradata.
+  bool waveFormat = blockAlign > 0;
   if (context->codec_id == AV_CODEC_ID_PCM_MULAW ||
       context->codec_id == AV_CODEC_ID_PCM_ALAW ||
-      (wma && rawSampleRate > 0 && rawChannelCount > 0)) {
+      (waveFormat && rawSampleRate > 0 && rawChannelCount > 0)) {
     context->sample_rate = rawSampleRate;
     av_channel_layout_default(&context->ch_layout, rawChannelCount);
   }
@@ -388,6 +410,9 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
   }
   if (bitRate > 0) {
     context->bit_rate = bitRate;
+  }
+  if (bitsPerCodedSample > 0) {
+    context->bits_per_coded_sample = bitsPerCodedSample;
   }
   context->err_recognition = AV_EF_IGNORE_ERR;
   int result = avcodec_open2(context, codec, NULL);
@@ -411,21 +436,47 @@ AVCodecContext* createContext(JNIEnv* env, const AVCodec* codec,
     releaseContext(context);
     return NULL;
   }
-  if (context->codec_id == AV_CODEC_ID_TRUEHD) {
-    // Media3's MatroskaExtractor glues 16 TrueHD access units into one sample,
-    // which is what the MediaCodec passthrough path wants, but this decoder
-    // takes one unit per packet and drops the rest of what it is given. The
-    // mlp parser cuts a sample back into the units it was made of, and reads
-    // the major sync into the context on the way, which the decoder needs
-    // since nothing here sets a channel layout for it.
-    state->parser = av_parser_init(AV_CODEC_ID_TRUEHD);
-    if (!state->parser) {
-      LOGE("Failed to allocate TrueHD parser.");
-      releaseContext(context);
-      return NULL;
-    }
+  if (!openParser(context, state)) {
+    releaseContext(context);
+    return NULL;
   }
   return context;
+}
+
+bool openParser(AVCodecContext* context, DecoderState* state) {
+  switch (context->codec_id) {
+    case AV_CODEC_ID_TRUEHD:
+      // Media3's MatroskaExtractor glues 16 TrueHD access units into one
+      // sample, which is what the MediaCodec passthrough path wants, but this
+      // decoder takes one unit per packet and drops the rest of what it is
+      // given. The mlp parser cuts a sample back into the units it was made
+      // of, and reads the major sync into the context on the way, which the
+      // decoder needs since nothing here sets a channel layout for it.
+      break;
+    case AV_CODEC_ID_MP1:
+    case AV_CODEC_ID_MP2:
+    case AV_CODEC_ID_MP3:
+      // AVI chunks and some MPEG-PS packets are not cut on frame boundaries,
+      // and the decoder takes one whole frame per packet. The mpegaudio parser
+      // holds a part frame over to the next sample.
+      if (!state->parserContext) {
+        state->parserContext = avcodec_alloc_context3(NULL);
+        if (!state->parserContext) {
+          LOGE("Failed to allocate parser context.");
+          return false;
+        }
+      }
+      state->parserContext->codec_id = context->codec_id;
+      break;
+    default:
+      return true;
+  }
+  state->parser = av_parser_init(context->codec_id);
+  if (!state->parser) {
+    LOGE("Failed to allocate parser.");
+    return false;
+  }
+  return true;
 }
 
 uint8_t* OutputBuffer::reserve(int bytes) {
@@ -445,14 +496,17 @@ uint8_t* OutputBuffer::reserve(int bytes) {
   return data + written;
 }
 
-int decodeAccessUnits(AVCodecContext* context, AVCodecParserContext* parser,
+int decodeAccessUnits(AVCodecContext* context, DecoderState* state,
                       AVPacket* packet, const uint8_t* input, int inputSize,
                       OutputBuffer* output) {
+  AVCodecParserContext* parser = state->parser;
+  AVCodecContext* parsed =
+      state->parserContext ? state->parserContext : context;
   int idle = 0;
   while (inputSize > 0) {
     uint8_t* unit = NULL;
     int unitSize = 0;
-    int used = av_parser_parse2(parser, context, &unit, &unitSize, input,
+    int used = av_parser_parse2(parser, parsed, &unit, &unitSize, input,
                                 inputSize, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
     if (used < 0) {
       logError("av_parser_parse2", used);
@@ -645,6 +699,7 @@ void releaseContext(AVCodecContext* context) {
     if (state->parser) {
       av_parser_close(state->parser);
     }
+    avcodec_free_context(&state->parserContext);
     av_packet_free(&state->packet);
     av_frame_free(&state->frame);
     av_channel_layout_uninit(&state->inLayout);

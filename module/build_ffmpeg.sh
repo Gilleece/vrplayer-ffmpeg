@@ -28,6 +28,10 @@ ENABLED_DECODERS=("${@:5}")
 echo "Enabled decoders are ${ENABLED_DECODERS[@]}"
 JOBS="$(nproc 2> /dev/null || sysctl -n hw.ncpu 2> /dev/null || echo 4)"
 echo "Using $JOBS jobs for make"
+# swscale turns the frame layouts the renderer does not take (4:2:2, 4:4:4,
+# RGB, palette, grey) into 4:2:0 in the video JNI. The parsers beyond h264 are
+# for elementary streams, the bitstream filter for AVI files with packed B
+# frames.
 COMMON_OPTIONS="
     --target-os=android
     --enable-static
@@ -37,8 +41,7 @@ COMMON_OPTIONS="
     --disable-everything
     --disable-avdevice
     --disable-avformat
-    --disable-swscale
-    --disable-postproc
+    --enable-swscale
     --disable-avfilter
     --disable-symver
     --enable-swresample
@@ -46,6 +49,11 @@ COMMON_OPTIONS="
     --disable-v4l2-m2m
     --disable-vulkan
     --enable-parser=h264
+    --enable-parser=hevc
+    --enable-parser=mpegvideo
+    --enable-parser=mpegaudio
+    --enable-parser=mjpeg
+    --enable-bsf=mpeg4_unpack_bframes
     "
 TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
 if [[ ! -d "${TOOLCHAIN_PREFIX}" ]]
@@ -59,37 +67,23 @@ do
     COMMON_OPTIONS="${COMMON_OPTIONS} --enable-decoder=${decoder}"
 done
 
-ARMV7_CLANG="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-clang"
-if [[ ! -e "$ARMV7_CLANG" ]]
-then
-    echo "AVMv7 Clang compiler with path $ARMV7_CLANG does not exist"
-    echo "It's likely your NDK version doesn't support ANDROID_ABI $ANDROID_ABI"
-    echo "Either use older version of NDK or raise ANDROID_ABI (be aware that ANDROID_ABI must not be greater than your application's minSdk)"
-    exit 1
-fi
 ANDROID_ABI_64BIT="$ANDROID_ABI"
 if [[ "$ANDROID_ABI_64BIT" -lt 21 ]]
 then
     echo "Using ANDROID_ABI 21 for 64-bit architectures"
     ANDROID_ABI_64BIT=21
 fi
+ARM64_CLANG="${TOOLCHAIN_PREFIX}/aarch64-linux-android${ANDROID_ABI_64BIT}-clang"
+if [[ ! -e "$ARM64_CLANG" ]]
+then
+    echo "arm64 Clang compiler with path $ARM64_CLANG does not exist"
+    echo "It's likely your NDK version doesn't support ANDROID_ABI $ANDROID_ABI"
+    echo "Either use older version of NDK or raise ANDROID_ABI (be aware that ANDROID_ABI must not be greater than your application's minSdk)"
+    exit 1
+fi
 
+# The app ships arm64-v8a alone, so that is the only ABI built
 cd "${FFMPEG_MODULE_PATH}/jni/ffmpeg"
-./configure \
-    --libdir=android-libs/armeabi-v7a \
-    --arch=arm \
-    --cpu=armv7-a \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --extra-cflags="-march=armv7-a -mfloat-abi=softfp" \
-    --extra-ldflags="-Wl,--fix-cortex-a8" \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
 ./configure \
     --libdir=android-libs/arm64-v8a \
     --arch=aarch64 \
@@ -99,34 +93,6 @@ make clean
     --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
     --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
     --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
-./configure \
-    --libdir=android-libs/x86 \
-    --arch=x86 \
-    --cpu=i686 \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/i686-linux-android${ANDROID_ABI}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --disable-asm \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
-./configure \
-    --libdir=android-libs/x86_64 \
-    --arch=x86_64 \
-    --cpu=x86-64 \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/x86_64-linux-android${ANDROID_ABI_64BIT}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --disable-asm \
     ${COMMON_OPTIONS}
 make -j$JOBS
 make install-libs

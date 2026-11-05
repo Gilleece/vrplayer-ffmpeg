@@ -14,10 +14,13 @@
 
 // The video half of the FFmpeg module: libavcodec's software decoders for the
 // files no MediaCodec decoder on the headset plays well, 10 bit H.264 (High
-// 10), MPEG-4 Part 2 with Microsoft's v2 and v3 (DivX, Xvid), and WMV 7, 8
-// and 9 with VC-1. All come out as 8 or 10 bit 4:2:0. FfmpegVideoDecoder drives it from its own thread. A
-// frame that comes out is held here until Java has an output buffer for it,
-// then its planes are copied into that buffer and the frame is let go.
+// 10), MPEG-4 Part 2 with Microsoft's v2 and v3 (DivX, Xvid), WMV 7, 8 and 9
+// with VC-1, MPEG-1 and 2, MJPEG, DV, ProRes, DNxHD and the old AVI codecs.
+// 8 and 10 bit 4:2:0 frames are copied as they are, anything else goes
+// through libswscale into 4:2:0 first. FfmpegVideoDecoder drives it from its
+// own thread. A frame that comes out is held here until Java has an output
+// buffer for it, then its planes are copied into that buffer and the frame is
+// let go.
 #include <android/log.h>
 #include <jni.h>
 #include <stdint.h>
@@ -27,6 +30,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 #define LOG_TAG "ffmpeg_video"
@@ -75,6 +79,14 @@ struct VideoState {
   // Sample times also go in as decode times, for the codecs whose container
   // may only have those (AVI). H.264 keeps presentation times alone.
   bool sendsDts;
+  // The held frame goes through sws on its way out
+  bool convert;
+  // Made for one input layout, size and range, remade when one changes
+  SwsContext* sws;
+  int swsFormat;
+  int swsWidth;
+  int swsHeight;
+  bool swsFull;
 };
 
 static void logError(const char* what, int error) {
@@ -90,10 +102,11 @@ static void releaseState(VideoState* state) {
   av_frame_free(&state->frame);
   av_packet_free(&state->packet);
   avcodec_free_context(&state->codec);
+  sws_freeContext(state->sws);
   av_free(state);
 }
 
-// 8 or 10, or 0 for a layout this path does not draw
+// 8 or 10 for the layouts copied as they are, else 0
 static int bitDepthOf(int format) {
   switch (format) {
     case AV_PIX_FMT_YUV420P10LE:
@@ -124,10 +137,91 @@ static int colorspaceOf(AVColorSpace space) {
 
 // 1 full, 0 limited, -1 when the stream does not say
 static int fullRangeOf(const AVFrame* frame) {
-  if (frame->format == AV_PIX_FMT_YUVJ420P || frame->color_range == AVCOL_RANGE_JPEG) {
+  switch (frame->format) {
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUVJ411P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_YUVJ440P:
+    case AV_PIX_FMT_YUVJ444P:
+      return 1;
+    default:
+      break;
+  }
+  if (frame->color_range == AVCOL_RANGE_JPEG) {
     return 1;
   }
   return frame->color_range == AVCOL_RANGE_MPEG ? 0 : -1;
+}
+
+// What a frame sws turns into 4:2:0 is drawn as. sws gets the same range on
+// both sides, so YUV and grey samples come out as they went in and keep the
+// range the stream gives. RGB and palette frames come out as full range
+// BT.601, sws's own matrix. Grey with no range said is taken as full, as sws
+// does.
+struct Converted {
+  int bitDepth;
+  int full;
+  int colorspace;
+  // The range sws is told for both sides
+  bool swsFull;
+};
+
+static bool convertedOf(const AVFrame* frame, Converted* out) {
+  const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get((AVPixelFormat)frame->format);
+  if (!desc || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)
+      || !sws_isSupportedInput((AVPixelFormat)frame->format)) {
+    return false;
+  }
+  out->bitDepth = desc->comp[0].depth > 8 ? 10 : 8;
+  if (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)) {
+    out->full = 1;
+    out->colorspace = COLORSPACE_BT601;
+    out->swsFull = true;
+  } else if (desc->nb_components < 3) {
+    // sws always reads grey as full range
+    out->full = fullRangeOf(frame) == 0 ? 0 : 1;
+    out->colorspace = COLORSPACE_BT601;
+    out->swsFull = true;
+  } else {
+    out->full = fullRangeOf(frame);
+    out->colorspace = colorspaceOf(frame->colorspace);
+    out->swsFull = out->full == 1;
+  }
+  return true;
+}
+
+// The cached context for this frame, made again if the frame differs
+static bool prepareSws(VideoState* state, const AVFrame* frame, int bitDepth, bool full) {
+  if (state->sws && state->swsFormat == frame->format && state->swsWidth == frame->width
+      && state->swsHeight == frame->height && state->swsFull == full) {
+    return true;
+  }
+  sws_freeContext(state->sws);
+  state->sws = sws_alloc_context();
+  if (!state->sws) {
+    return false;
+  }
+  SwsContext* sws = state->sws;
+  sws->src_w = sws->dst_w = frame->width;
+  sws->src_h = sws->dst_h = frame->height;
+  sws->src_format = frame->format;
+  sws->dst_format = bitDepth > 8 ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+  // The same range both sides, so YUV samples are not stretched or squeezed
+  sws->src_range = sws->dst_range = full;
+  sws->flags = SWS_BILINEAR;
+  sws->threads = 1;
+  int result = sws_init_context(sws, NULL, NULL);
+  if (result < 0) {
+    logError("sws_init_context", result);
+    sws_freeContext(state->sws);
+    state->sws = NULL;
+    return false;
+  }
+  state->swsFormat = frame->format;
+  state->swsWidth = frame->width;
+  state->swsHeight = frame->height;
+  state->swsFull = full;
+  return true;
 }
 
 static void copyPlane(uint8_t* dst, int dstStride, const uint8_t* src, int srcStride,
@@ -138,7 +232,7 @@ static void copyPlane(uint8_t* dst, int dstStride, const uint8_t* src, int srcSt
 }
 
 VIDEO_FUNC(jlong, ffmpegVideoInit, jstring codecName, jbyteArray extraData,
-           jint threads, jint width, jint height) {
+           jint threads, jint width, jint height, jint bitsPerPixel) {
   const char* name = env->GetStringUTFChars(codecName, NULL);
   const AVCodec* codec = avcodec_find_decoder_by_name(name);
   env->ReleaseStringUTFChars(codecName, name);
@@ -171,11 +265,17 @@ VIDEO_FUNC(jlong, ffmpegVideoInit, jstring codecName, jbyteArray extraData,
     context->extradata_size = size;
     env->GetByteArrayRegion(extraData, 0, size, (jbyte*)context->extradata);
   }
-  // Microsoft's MPEG-4, WMV 7 and 8 and WMV3 have no frame size in the
-  // stream, only in the container
+  // Microsoft's MPEG-4, WMV 7 and 8, WMV3 and the old AVI codecs (Video 1,
+  // RLE, HuffYUV, Lagarith) have no frame size in the stream, only in the
+  // container
   if (width > 0 && height > 0) {
     context->width = width;
     context->height = height;
+  }
+  // The BITMAPINFOHEADER's bit count, which msrle and a few other AVI codecs
+  // open by
+  if (bitsPerPixel > 0) {
+    context->bits_per_coded_sample = bitsPerPixel;
   }
   // Timestamps go in and come out in microseconds, untouched
   AVRational micros = {1, 1000000};
@@ -254,20 +354,31 @@ VIDEO_FUNC(jint, ffmpegVideoReceive, jlong handle, jintArray info, jlongArray pt
   }
   AVFrame* frame = state->frame;
   int bitDepth = bitDepthOf(frame->format);
-  if (bitDepth == 0) {
-    const char* formatName = av_get_pix_fmt_name((AVPixelFormat)frame->format);
-    LOGE("Pixel format %s is not drawn", formatName ? formatName : "unknown");
-    av_frame_unref(frame);
-    return STATUS_ERROR;
+  int full = fullRangeOf(frame);
+  int colorspace = colorspaceOf(frame->colorspace);
+  bool convert = bitDepth == 0;
+  if (convert) {
+    Converted converted;
+    if (!convertedOf(frame, &converted)
+        || !prepareSws(state, frame, converted.bitDepth, converted.swsFull)) {
+      const char* formatName = av_get_pix_fmt_name((AVPixelFormat)frame->format);
+      LOGE("Pixel format %s is not drawn", formatName ? formatName : "unknown");
+      av_frame_unref(frame);
+      return STATUS_ERROR;
+    }
+    bitDepth = converted.bitDepth;
+    full = converted.full;
+    colorspace = converted.colorspace;
   }
   state->held = true;
   state->bitDepth = bitDepth;
+  state->convert = convert;
   jint values[INFO_LENGTH];
   values[INFO_WIDTH] = frame->width;
   values[INFO_HEIGHT] = frame->height;
   values[INFO_BIT_DEPTH] = bitDepth;
-  values[INFO_FULL_RANGE] = fullRangeOf(frame);
-  values[INFO_COLORSPACE] = colorspaceOf(frame->colorspace);
+  values[INFO_FULL_RANGE] = full;
+  values[INFO_COLORSPACE] = colorspace;
   values[INFO_DELAY] = state->codec->has_b_frames;
   env->SetIntArrayRegion(info, 0, INFO_LENGTH, values);
   jlong times[2];
@@ -305,6 +416,15 @@ VIDEO_FUNC(jint, ffmpegVideoCopy, jlong handle, jobject data, jint yStride, jint
       || capacity < ySize + uvSize * 2) {
     LOGE("Output buffer too small for %dx%d", width, height);
     status = STATUS_ERROR;
+  } else if (state->convert) {
+    uint8_t* planes[4] = {out, out + ySize, out + ySize + uvSize, NULL};
+    int strides[4] = {yStride, uvStride, uvStride, 0};
+    int result = sws_scale(state->sws, frame->data, frame->linesize, 0, height, planes,
+                           strides);
+    if (result < 0) {
+      logError("sws_scale", result);
+      status = STATUS_ERROR;
+    }
   } else {
     copyPlane(out, yStride, frame->data[0], frame->linesize[0], width * bytes, height);
     copyPlane(out + ySize, uvStride, frame->data[1], frame->linesize[1], chromaWidth * bytes,
